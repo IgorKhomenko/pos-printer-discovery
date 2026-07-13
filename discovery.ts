@@ -43,12 +43,6 @@ const VIRTUAL_INTERFACE =
 function isPhysicalNetworkInterface(name: string): boolean {
   if (VIRTUAL_INTERFACE.test(name)) return false;
 
-  // if (/^(eth|em|wlan|wifi)\d/i.test(name)) return true;
-  // if (/^wlp\d+s\d+/i.test(name)) return true; // Linux: wlp9s0
-  // if (/^wlx/i.test(name)) return true; // Linux: USB Wi‑Fi
-  // if (/^en[ops]\d/i.test(name)) return true;
-  // if (/^en\d+$/i.test(name)) return true; // macOS: en0 = Wi‑Fi, en5 = USB ethernet
-  // if (/^(Ethernet|Wi-Fi)(\s|\d|$)/i.test(name)) return true;
   if (/^(eth|em|en|wl|ww)/i.test(name)) return true;
 
   return false;
@@ -100,21 +94,37 @@ function generateSubnetIps(subnet: Subnet): string[] {
 // -----------------------------
 // Get MAC address for a single IP
 // -----------------------------
+function parseMacAddress(output: string): string | undefined {
+  const colonMatch = output.match(
+    /\b([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})\b/i
+  );
+  if (colonMatch) return colonMatch[1].toLowerCase();
+
+  // Windows: 00-11-22-33-44-55
+  const dashMatch = output.match(
+    /\b([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b/i
+  );
+  if (dashMatch) return dashMatch[1].replace(/-/g, ":").toLowerCase();
+
+  return undefined;
+}
+
+function getArpLookupCommand(ip: string): string {
+  if (process.platform === "win32") {
+    return `arp -a ${ip}`;
+  }
+  return `arp -n ${ip}`;
+}
+
 function getMacAddress(ip: string): Promise<string | undefined> {
   if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
     return Promise.resolve(undefined);
   }
 
   return new Promise((resolve) => {
-    exec(`arp -n ${ip}`, (err, stdout) => {
+    exec(getArpLookupCommand(ip), (err, stdout) => {
       if (err) return resolve(undefined);
-
-      // macOS: ? (192.168.68.113) at 00:11:22:33:44:55 on en0
-      // Linux: 192.168.68.113 ether 00:11:22:33:44:55 C eth0
-      const match = stdout.match(
-        /\b([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})\b/i
-      );
-      resolve(match?.[1]);
+      resolve(parseMacAddress(stdout));
     });
   });
 }
