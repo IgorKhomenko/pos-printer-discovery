@@ -10,40 +10,123 @@ type Device = {
   mac?: string;
 };
 
+type Subnet = {
+  network: number;
+  mask: number;
+  address: string;
+  name: string;
+};
+
 // -----------------------------
-// Get ARP table
+// Subnet helpers
 // -----------------------------
-function getArpTable(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    exec("arp -a", (err, stdout) => {
-      if (err) return reject(err);
-      resolve(stdout);
-    });
-  });
+function ipv4ToInt(ip: string): number {
+  return (
+    ip
+      .split(".")
+      .reduce((acc, octet) => (acc << 8) + parseInt(octet, 10), 0) >>> 0
+  );
 }
 
-// -----------------------------
-// Parse ARP output (macOS/Linux)
-// -----------------------------
-function parseArp(output: string): Device[] {
-  const devices: Device[] = [];
+function intToIpv4(n: number): string {
+  return [
+    (n >>> 24) & 255,
+    (n >>> 16) & 255,
+    (n >>> 8) & 255,
+    n & 255,
+  ].join(".");
+}
 
-  const lines = output.split("\n");
+const VIRTUAL_INTERFACE =
+  /^(lo|awdl|utun|bridge|veth|docker|tun|tap|ap|ppp|gif|stf|xhc|anpi|rvi|pktap)/i;
 
-  for (const line of lines) {
-    // macOS example:
-    // ? (192.168.68.120) at 00:11:22:33:44:55 on en0
-    const match = line.match(/\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-f:]+)/i);
+function isPhysicalNetworkInterface(name: string): boolean {
+  if (VIRTUAL_INTERFACE.test(name)) return false;
 
-    if (match) {
-      devices.push({
-        ip: match[1],
-        mac: match[2],
-      });
+  if (/^(eth|em|en|wl|ww)/i.test(name)) return true;
+
+  return false;
+}
+
+function isLinkLocalAddress(ip: string): boolean {
+  return ip.startsWith("169.254.");
+}
+
+function getLocalSubnets(): Subnet[] {
+  const seen = new Set<string>();
+  const subnets: Subnet[] = [];
+
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (!addrs || !isPhysicalNetworkInterface(name)) continue;
+
+    for (const iface of addrs) {
+      if (iface.internal) continue;
+      if (iface.family !== "IPv4") continue;
+      if (isLinkLocalAddress(iface.address)) continue;
+
+      const mask = ipv4ToInt(iface.netmask);
+      const network = (ipv4ToInt(iface.address) & mask) >>> 0;
+      const key = `${network}:${mask}`;
+
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      subnets.push({ network, mask, address: iface.address, name });
     }
   }
 
-  return devices;
+  return subnets;
+}
+
+function generateSubnetIps(subnet: Subnet): string[] {
+  const network = subnet.network >>> 0;
+  const mask = subnet.mask >>> 0;
+  const broadcast = (network | ~mask) >>> 0;
+  const ips: string[] = [];
+
+  for (let ip = network + 1; ip < broadcast; ip++) {
+    ips.push(intToIpv4(ip));
+  }
+
+  return ips;
+}
+
+// -----------------------------
+// Get MAC address for a single IP
+// -----------------------------
+function parseMacAddress(output: string): string | undefined {
+  const colonMatch = output.match(
+    /\b([0-9a-f]{1,2}(?::[0-9a-f]{1,2}){5})\b/i
+  );
+  if (colonMatch) return colonMatch[1].toLowerCase();
+
+  // Windows: 00-11-22-33-44-55
+  const dashMatch = output.match(
+    /\b([0-9a-f]{2}(?:-[0-9a-f]{2}){5})\b/i
+  );
+  if (dashMatch) return dashMatch[1].replace(/-/g, ":").toLowerCase();
+
+  return undefined;
+}
+
+function getArpLookupCommand(ip: string): string {
+  if (process.platform === "win32") {
+    return `arp -a ${ip}`;
+  }
+  return `arp -n ${ip}`;
+}
+
+function getMacAddress(ip: string): Promise<string | undefined> {
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+    return Promise.resolve(undefined);
+  }
+
+  return new Promise((resolve) => {
+    exec(getArpLookupCommand(ip), (err, stdout) => {
+      if (err) return resolve(undefined);
+      resolve(parseMacAddress(stdout));
+    });
+  });
 }
 
 // -----------------------------
@@ -82,45 +165,74 @@ async function asyncPool<T, R>(
   array: T[],
   iteratorFn: (item: T) => Promise<R>
 ): Promise<R[]> {
-  const ret: R[] = [];
-  const executing: Promise<any>[] = [];
+  const results: R[] = new Array(array.length);
+  let index = 0;
 
-  for (const item of array) {
-    const p = Promise.resolve().then(() => iteratorFn(item));
-    ret.push(await p);
-
-    if (limit <= array.length) {
-      const e: Promise<any> = p.then(() =>
-        executing.splice(executing.indexOf(e), 1)
-      );
-      executing.push(e);
-
-      if (executing.length >= limit) {
-        await Promise.race(executing);
-      }
+  async function worker() {
+    while (index < array.length) {
+      const i = index++;
+      results[i] = await iteratorFn(array[i]);
     }
   }
 
-  return ret;
+  const workers = Array.from(
+    { length: Math.min(limit, array.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+
+  return results;
+}
+
+function elapsedSeconds(start: number): string {
+  return ((performance.now() - start) / 1000).toFixed(3);
 }
 
 // -----------------------------
 // Main scan function
 // -----------------------------
-export async function discoverPrinters() {
-  const arpOutput = await getArpTable();
-//   console.log(arpOutput);
-  const devices = parseArp(arpOutput);
+export async function discoverPrinters(): Promise<Device[]> {
+  const totalStart = performance.now();
+  console.log("Discovering printers...");
 
-  const results: Device[] = [];
+  let start = performance.now();
+  const subnets = getLocalSubnets();
+  console.log({subnets});
+  const ips = [
+    ...new Set(subnets.flatMap((subnet) => generateSubnetIps(subnet))),
+  ];
+  console.log(
+    `[subnets] ${elapsedSeconds(start)}s (${subnets.length} subnets, ${ips.length} IPs)`
+  );
 
-  await asyncPool(20, devices, async (device) => {
-    const isOpen = await checkPort9100(device.ip);
+  if (ips.length === 0) {
+    console.log(`[total] ${elapsedSeconds(totalStart)}s`);
+    return [];
+  }
 
-    if (isOpen) {
-      results.push(device);
-    }
+  start = performance.now();
+  const scanResults = await asyncPool(50, ips, async (ip) => {
+    const isOpen = await checkPort9100(ip);
+    return isOpen ? ip : null;
   });
 
-  return results;
+  const foundIps = scanResults.filter((ip): ip is string => ip !== null);
+  console.log(
+    `[port scan] ${elapsedSeconds(start)}s (${foundIps.length} open on port 9100)`
+  );
+
+  if (foundIps.length === 0) {
+    console.log(`[total] ${elapsedSeconds(totalStart)}s`);
+    return [];
+  }
+
+  start = performance.now();
+  const printers = await asyncPool(10, foundIps, async (ip) => ({
+    ip,
+    mac: await getMacAddress(ip),
+  }));
+  console.log(`[mac lookup] ${elapsedSeconds(start)}s`);
+  console.log(`[total] ${elapsedSeconds(totalStart)}s`);
+
+  return printers;
 }
