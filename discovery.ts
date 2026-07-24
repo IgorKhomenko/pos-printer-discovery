@@ -43,7 +43,7 @@ const VIRTUAL_INTERFACE =
 function isPhysicalNetworkInterface(name: string): boolean {
   if (VIRTUAL_INTERFACE.test(name)) return false;
 
-  if (/^(eth|em|en|wl|ww|wifi)/i.test(name)) return true;
+  if (/^(eth|em|en|wl|ww|wifi|wi-fi)/i.test(name)) return true;
 
   return false;
 }
